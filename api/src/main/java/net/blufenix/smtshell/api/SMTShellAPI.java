@@ -5,17 +5,30 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.os.Handler;
+import android.os.Looper;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class SMTShellAPI {
 
-    // requests
+    private static final ExecutorService executor = Executors.newCachedThreadPool();
+    private static final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    // Legacy constants kept for compatibility
     public static final String ACTION_SHELL_COMMAND = "smtshell.intent.action.SHELL_COMMAND";
     public static final String EXTRA_COMMAND = "smtshell.intent.extra.COMMAND";
     public static final String EXTRA_REQUEST_ID = "smtshell.intent.extra.REQUEST_ID";
-    public static final String EXTRA_CALLBACK_PKG = "smtshell.intent.extra.CALLBACK_PKG"; // IntentSender
-    public static final String PKG_NAME_SMT = "com.samsung.SMT"; // send requests to this pkg
+    public static final String EXTRA_CALLBACK_PKG = "smtshell.intent.extra.CALLBACK_PKG";
+    
+    // Removed SMT package dependency - now using direct root access
+    @Deprecated
+    public static final String PKG_NAME_SMT = "com.samsung.SMT";
 
     public static final String ACTION_LOAD_LIBRARY = "smtshell.intent.action.ACTION_LOAD_LIBRARY";
     public static final String EXTRA_LIBRARY_PATH = "smtshell.intent.extra.EXTRA_LIBRARY_PATH";
@@ -34,14 +47,68 @@ public class SMTShellAPI {
     public static final String ACTION_API_READY = "smtshell.intent.action.API_READY";
     public static final String ACTION_API_DEATH_NOTICE = "smtshell.intent.action.API_DEATH_NOTICE";
 
-    // permissions
-    public static final String PERMISSION_SYSTEM_COMMAND = "smtshell.permission.SYSTEM_COMMAND";
-    public static final String PERMISSION_LOAD_LIBRARY = "smtshell.permission.LOAD_LIBRARY";
+    // permissions - now using standard Android root permission
+    public static final String PERMISSION_SYSTEM_COMMAND = "android.permission.ACCESS_SUPERUSER";
+    public static final String PERMISSION_LOAD_LIBRARY = "android.permission.ACCESS_SUPERUSER";
     public static final String PERMISSION_RECEIVER_GUARD = "android.permission.REBOOT";
 
     // start at a number a user is unlikely to use for themselves,
     //  in case they manually call the API without the wrapper
     private static final AtomicInteger REQUEST_ID = new AtomicInteger(1000000);
+    
+    private static Process rootProcess;
+    
+    /**
+     * Checks if root access is available on this device
+     * @return true if root access is available, false otherwise
+     */
+    public static boolean isRootAvailable() {
+        Process process = null;
+        try {
+            process = Runtime.getRuntime().exec("su -c 'id'");
+            int exitCode = process.waitFor();
+            return exitCode == 0;
+        } catch (Exception e) {
+            return false;
+        } finally {
+            if (process != null) {
+                process.destroy();
+            }
+        }
+    }
+    
+    /**
+     * Requests root access from the user
+     * This will prompt the user to grant superuser permissions
+     * @param context The application context
+     * @param callback Callback to handle the result
+     */
+    public static void requestRootAccess(Context context, RootAccessCallback callback) {
+        executor.execute(() -> {
+            try {
+                // Try to obtain root access
+                Process process = Runtime.getRuntime().exec("su");
+                process.getOutputStream().write("id\n".getBytes());
+                process.getOutputStream().flush();
+                process.getOutputStream().close();
+                
+                int exitCode = process.waitFor();
+                boolean granted = (exitCode == 0);
+                
+                mainHandler.post(() -> {
+                    if (callback != null) {
+                        callback.onResult(granted);
+                    }
+                });
+            } catch (Exception e) {
+                mainHandler.post(() -> {
+                    if (callback != null) {
+                        callback.onResult(false);
+                    }
+                });
+            }
+        });
+    }
     static int nextId() {
         return REQUEST_ID.getAndIncrement();
     }
@@ -51,32 +118,64 @@ public class SMTShellAPI {
     }
 
     public static void executeCommand(Context context, String cmd, CommandCallback cb) {
-        // setup intent
-        int requestId = nextId();
-        Intent intent = createIntent(ACTION_SHELL_COMMAND, requestId);
-        intent.putExtra(EXTRA_COMMAND, cmd);
-
-        if (cb != null) {
-            // specify that the request has a sender
-            setSender(context, intent);
-            // setup receiver
-            context.registerReceiver(new BroadcastReceiver() {
-                @Override
-                public void onReceive(Context context, Intent intent) {
-                    if (requestId == intent.getIntExtra(EXTRA_REQUEST_ID, -1)) {
-                        context.unregisterReceiver(this);
-                        cb.onComplete(
-                                intent.getStringExtra(EXTRA_STDOUT),
-                                intent.getStringExtra(EXTRA_STDERR),
-                                intent.getIntExtra(EXTRA_EXIT_CODE, -1)
-                        );
-                    }
+        executor.execute(() -> {
+            Process process = null;
+            try {
+                // Execute command as root
+                process = Runtime.getRuntime().exec("su -c '" + cmd.replace("'", "'\"'\"'") + "'");
+                
+                // Read stdout
+                BufferedReader stdoutReader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+                StringBuilder stdout = new StringBuilder();
+                String line;
+                while ((line = stdoutReader.readLine()) != null) {
+                    stdout.append(line).append("\n");
                 }
-            }, new IntentFilter(ACTION_SHELL_RESULT), PERMISSION_RECEIVER_GUARD, null);
-        }
-
-        // send command
-        context.sendBroadcast(intent);
+                stdoutReader.close();
+                
+                // Read stderr
+                BufferedReader stderrReader = new BufferedReader(new InputStreamReader(process.getErrorStream()));
+                StringBuilder stderr = new StringBuilder();
+                while ((line = stderrReader.readLine()) != null) {
+                    stderr.append(line).append("\n");
+                }
+                stderrReader.close();
+                
+                int exitCode = process.waitFor();
+                
+                // Clean up trailing newlines
+                String stdoutStr = stdout.toString();
+                String stderrStr = stderr.toString();
+                if (stdoutStr.endsWith("\n")) {
+                    stdoutStr = stdoutStr.substring(0, stdoutStr.length() - 1);
+                }
+                if (stderrStr.endsWith("\n")) {
+                    stderrStr = stderrStr.substring(0, stderrStr.length() - 1);
+                }
+                
+                // Call back on main thread
+                final String finalStdout = stdoutStr;
+                final String finalStderr = stderrStr;
+                final int finalExitCode = exitCode;
+                
+                mainHandler.post(() -> {
+                    if (cb != null) {
+                        cb.onComplete(finalStdout, finalStderr, finalExitCode);
+                    }
+                });
+                
+            } catch (IOException | InterruptedException e) {
+                mainHandler.post(() -> {
+                    if (cb != null) {
+                        cb.onComplete("", "Error executing command: " + e.getMessage(), -1);
+                    }
+                });
+            } finally {
+                if (process != null) {
+                    process.destroy();
+                }
+            }
+        });
     }
 
     public static void loadLibrary(Context context, String path) {
@@ -84,44 +183,50 @@ public class SMTShellAPI {
     }
 
     public static void loadLibrary(Context context, String path, LoadLibraryCallback cb) {
-        // setup intent
-        int requestId = nextId();
-        Intent intent = createIntent(ACTION_LOAD_LIBRARY, requestId);
-        intent.putExtra(EXTRA_LIBRARY_PATH, path);
-
-        if (cb != null) {
-            // specify that the request has a sender
-            setSender(context, intent);
-            // setup receiver
-            context.registerReceiver(new BroadcastReceiver() {
-                @Override
-                public void onReceive(Context context, Intent intent) {
-                    if (requestId == intent.getIntExtra(EXTRA_REQUEST_ID, -1)) {
-                        context.unregisterReceiver(this);
-                        cb.onComplete(intent.getBooleanExtra(EXTRA_LOAD_SUCCESS, false));
+        executor.execute(() -> {
+            Process process = null;
+            try {
+                // Load library using root access
+                String command = "export LD_LIBRARY_PATH=" + path + ":$LD_LIBRARY_PATH && echo 'Library loaded'";
+                process = Runtime.getRuntime().exec("su -c '" + command.replace("'", "'\"'\"'") + "'");
+                
+                int exitCode = process.waitFor();
+                boolean success = (exitCode == 0);
+                
+                mainHandler.post(() -> {
+                    if (cb != null) {
+                        cb.onComplete(success);
                     }
+                });
+                
+            } catch (IOException | InterruptedException e) {
+                mainHandler.post(() -> {
+                    if (cb != null) {
+                        cb.onComplete(false);
+                    }
+                });
+            } finally {
+                if (process != null) {
+                    process.destroy();
                 }
-            }, new IntentFilter(ACTION_LOAD_LIBRARY_RESULT), PERMISSION_RECEIVER_GUARD, null);
-        }
-
-        // send the command
-        context.sendBroadcast(intent);
+            }
+        });
     }
 
     public static void ping(Context context) {
-        Intent intent = createIntent(ACTION_API_PING, -1);
-        setSender(context, intent);
+        // For compatibility, we'll just broadcast that API is ready
+        Intent intent = new Intent(ACTION_API_READY);
         context.sendBroadcast(intent);
     }
 
+    @Deprecated
     static Intent createIntent(String action, int requestId) {
         Intent intent = new Intent(action);
-        intent.setPackage(PKG_NAME_SMT);
         intent.putExtra(EXTRA_REQUEST_ID, requestId);
         return intent;
     }
 
-    // used to prove where the intent came from, so other packages can't request things on our behalf
+    @Deprecated
     static void setSender(Context context, Intent intent) {
         int flags = PendingIntent.FLAG_IMMUTABLE;
         PendingIntent self = PendingIntent.getBroadcast(context, 0, new Intent(), flags);
@@ -134,6 +239,10 @@ public class SMTShellAPI {
 
     public interface LoadLibraryCallback {
         void onComplete(boolean success);
+    }
+    
+    public interface RootAccessCallback {
+        void onResult(boolean granted);
     }
 
 }

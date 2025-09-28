@@ -1,4 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    
+    <!-- Permissions for root access -->
+    <uses-permission android:name="android.permission.ACCESS_SUPERUSER" />
+    <uses-permission android:name="android.permission.REBOOT" />
+    
+    <!-- Legacy permissions for backward compatibility -->
+    <uses-permission android:name="smtshell.permission.SYSTEM_COMMAND" />
+    <uses-permission android:name="smtshell.permission.LOAD_LIBRARY" />
 
 </manifest>
