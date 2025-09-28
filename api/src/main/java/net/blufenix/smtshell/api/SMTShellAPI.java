@@ -63,12 +63,17 @@ public class SMTShellAPI {
      * @return true if root access is available, false otherwise
      */
     public static boolean isRootAvailable() {
+        Process process = null;
         try {
-            Process process = Runtime.getRuntime().exec("su -c 'id'");
+            process = Runtime.getRuntime().exec("su -c 'id'");
             int exitCode = process.waitFor();
             return exitCode == 0;
         } catch (Exception e) {
             return false;
+        } finally {
+            if (process != null) {
+                process.destroy();
+            }
         }
     }
     
@@ -114,9 +119,10 @@ public class SMTShellAPI {
 
     public static void executeCommand(Context context, String cmd, CommandCallback cb) {
         executor.execute(() -> {
+            Process process = null;
             try {
                 // Execute command as root
-                Process process = Runtime.getRuntime().exec("su -c '" + cmd.replace("'", "'\"'\"'") + "'");
+                process = Runtime.getRuntime().exec("su -c '" + cmd.replace("'", "'\"'\"'") + "'");
                 
                 // Read stdout
                 BufferedReader stdoutReader = new BufferedReader(new InputStreamReader(process.getInputStream()));
@@ -125,6 +131,7 @@ public class SMTShellAPI {
                 while ((line = stdoutReader.readLine()) != null) {
                     stdout.append(line).append("\n");
                 }
+                stdoutReader.close();
                 
                 // Read stderr
                 BufferedReader stderrReader = new BufferedReader(new InputStreamReader(process.getErrorStream()));
@@ -132,6 +139,7 @@ public class SMTShellAPI {
                 while ((line = stderrReader.readLine()) != null) {
                     stderr.append(line).append("\n");
                 }
+                stderrReader.close();
                 
                 int exitCode = process.waitFor();
                 
@@ -162,6 +170,10 @@ public class SMTShellAPI {
                         cb.onComplete("", "Error executing command: " + e.getMessage(), -1);
                     }
                 });
+            } finally {
+                if (process != null) {
+                    process.destroy();
+                }
             }
         });
     }
@@ -172,10 +184,11 @@ public class SMTShellAPI {
 
     public static void loadLibrary(Context context, String path, LoadLibraryCallback cb) {
         executor.execute(() -> {
+            Process process = null;
             try {
                 // Load library using root access
                 String command = "export LD_LIBRARY_PATH=" + path + ":$LD_LIBRARY_PATH && echo 'Library loaded'";
-                Process process = Runtime.getRuntime().exec("su -c '" + command.replace("'", "'\"'\"'") + "'");
+                process = Runtime.getRuntime().exec("su -c '" + command.replace("'", "'\"'\"'") + "'");
                 
                 int exitCode = process.waitFor();
                 boolean success = (exitCode == 0);
@@ -192,6 +205,10 @@ public class SMTShellAPI {
                         cb.onComplete(false);
                     }
                 });
+            } finally {
+                if (process != null) {
+                    process.destroy();
+                }
             }
         });
     }
